@@ -5,6 +5,7 @@ from core.registry import Registry
 from tools.base import WrappedTool
 from tools.cosmology import CosmologyTool
 from tools.filetools import DEFAULT_MAX_CHARS, DEFAULT_MAX_ROWS, ReadFileTool
+from tools.localmode import LocalSearchTool, LocalVisitWebpageTool
 from tools.misc import CalculatorTool, CurrentTimeTool, JsonFinalAnswerTool
 from tools.numerics import NumericsTool
 from tools.searchtools import (
@@ -51,7 +52,12 @@ def make_web_search_tool(
     retry_wait_s: float | list[float] = (5.0, 15.0, 30.0),
     min_interval_s: float = 2.0,
     blocked_urls: list[str] | tuple[str, ...] = TavilySearchTool.BLOCKED_URLS,
+    base_url: str | None = None,
 ) -> WrappedTool:
+    # `base_url` (local mode): the search is answered by the local server from a frozen snapshot, whatever the engine.
+    if base_url:
+        return WrappedTool(wrapped_tool=LocalSearchTool(base_url, max_results), watcher=watcher)
+
     # The DuckDuckGo search fails often at random, more so when several agents search at once (issues #59, #60), so
     # all agents keep one pace (`min_interval_s`) and a failed search is tried again, with growing waits (`attempts`,
     # `retry_wait_s`), before the agent sees an error. The Tavily search (`engine="tavily"`, issue #66) uses an API key
@@ -83,18 +89,29 @@ def make_web_search_tool(
 
 
 @tool_registry.register("wikipedia_search")
-def make_wiki_search_tool(watcher, operator: str = "OPERATOR EMAIL NOT SET") -> WrappedTool:
+def make_wiki_search_tool(
+    watcher, operator: str = "OPERATOR EMAIL NOT SET", base_url: str | None = None
+) -> WrappedTool:
     logger.info("api operator email was not set. This should be done for best compliance with wikipedia api rules")
-    return WrappedTool(wrapped_tool=ImprovedWikipediaSearchTool(operator), watcher=watcher)
+    return WrappedTool(wrapped_tool=ImprovedWikipediaSearchTool(operator, base_url=base_url), watcher=watcher)
 
 
 @tool_registry.register("arxiv_search")
-def make_arxiv_search_tool(watcher, operator: str = "OPERATOR EMAIL NOT SET") -> WrappedTool:
-    return WrappedTool(wrapped_tool=ArxivSearchTool(operator), watcher=watcher)
+def make_arxiv_search_tool(
+    watcher, operator: str = "OPERATOR EMAIL NOT SET", base_url: str | None = None
+) -> WrappedTool:
+    return WrappedTool(wrapped_tool=ArxivSearchTool(operator, base_url=base_url), watcher=watcher)
 
 
 @tool_registry.register("visit_webpage")
-def make_visit_webpage_tool(watcher, blocked_networks: list[str] | tuple[str, ...] = ()) -> WrappedTool:
+def make_visit_webpage_tool(
+    watcher, blocked_networks: list[str] | tuple[str, ...] = (), base_url: str | None = None
+) -> WrappedTool:
+    if base_url:  # local mode: pages come from the local server, nothing is fetched from the internet
+        return WrappedTool(
+            wrapped_tool=LocalVisitWebpageTool(base_url, max_output_length=_VISIT_WEBPAGE_MAX_OUTPUT_LENGTH),
+            watcher=watcher,
+        )
     # Only public web addresses: no loopback, private, link-local (cloud metadata) or other non-public address, and
     # none in `blocked_networks` (CIDR ranges, for internal services on public addresses), checked on every redirect.
     tool = PublicVisitWebpageTool(max_output_length=_VISIT_WEBPAGE_MAX_OUTPUT_LENGTH, blocked_networks=blocked_networks)
