@@ -308,3 +308,23 @@ class _OnlyCached:
     def get(self, url, params=None, *, api=True):
         path = self.fetcher._key(url, params)
         return self.fetcher.get(url, params, api=api) if path.exists() else self.fake.get(url, params, api=api)
+
+
+# URLs the tasks only point to loosely
+
+
+def test_extra_urls_are_read_with_an_optional_task_id(tmp_path):
+    path = tmp_path / "extra.txt"
+    path.write_text("# a query\nhttps://x.org/a?q=1 SFB-0038  # the planet\n\nhttps://x.org/b\n", encoding="utf-8")
+    assert build.load_extra_urls(path) == [("https://x.org/a?q=1", "SFB-0038"), ("https://x.org/b", "extra")]
+    assert build.load_extra_urls(None) == []
+
+
+def test_extra_urls_are_checked_and_built_like_task_sources(tasks_file, tmp_path):
+    extra = [("https://example.org/query?q=1&format=csv", "T9")]
+    needs = {n.request_key: n for n in build.build_inventory(TASKS, extra)}
+    assert needs["https://example.org/query?format=csv&q=1"].task_ids == {"T9"}
+    results = {r["url"]: r["status"] for r in build.check(tasks_file, FakeFetcher(), extra=extra)}
+    assert results["https://example.org/query?q=1&format=csv"] == "ok"
+    build.build(tasks_file, tmp_path / "snap", FakeFetcher(), snapshot_date="2026-11-01", extra=extra)
+    assert SnapshotStore(tmp_path / "snap").has("web", "https://example.org/query?format=csv&q=1")

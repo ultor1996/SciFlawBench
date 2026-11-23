@@ -383,7 +383,22 @@ def urls_in_text(text: str) -> list[str]:
     return out
 
 
-def build_inventory(tasks: list[dict]) -> list[Need]:
+def load_extra_urls(path: str | Path | None) -> list[tuple[str, str]]:
+    """URLs to store besides the ones the tasks cite: one per line, `URL [task id]`; `#` starts a comment.
+
+    For pages the tasks only point to loosely, for example the exact query an agent is expected to send to a database
+    (the task text holds an unfinished one).
+    """
+    out = []
+    if path:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            parts = line.split("#", 1)[0].split()
+            if parts:
+                out.append((parts[0], parts[1] if len(parts) > 1 else "extra"))
+    return out
+
+
+def build_inventory(tasks: list[dict], extra: list[tuple[str, str]] = ()) -> list[Need]:
     """Every distinct `(service, request_key, role)` the tasks cite, with the tasks that cite it, in a fixed order."""
     needs: dict[tuple[str, str, str], Need] = {}
 
@@ -401,6 +416,8 @@ def build_inventory(tasks: list[dict]) -> list[Need]:
             add(url, "prompt", task_id)
         for url in urls_in_text(json.dumps(task.get("validators") or [], ensure_ascii=False)):
             add(url, "gold", task_id, note="validators")
+    for url, task_id in extra:
+        add(url, "gold", task_id, note="extra")
     return sorted(needs.values(), key=lambda n: (n.role != "gold", n.service, n.request_key))
 
 
@@ -428,7 +445,9 @@ def fetch_need(builder: Builder, collector: Collector, need: Need) -> None:
 # ---- check: do the sources work? -------------------------------------------------------------------------------------
 
 
-def check(tasks_path: str | Path, fetcher: Fetcher, *, limit_tasks: int = 0) -> list[dict]:
+def check(
+    tasks_path: str | Path, fetcher: Fetcher, *, limit_tasks: int = 0, extra: list[tuple[str, str]] = ()
+) -> list[dict]:
     """Ask for every needed source, store nothing, and say for each whether it worked.
 
     The answers go into the fetcher's cache, so the build that follows does not ask again for the ones that worked.
@@ -436,7 +455,7 @@ def check(tasks_path: str | Path, fetcher: Fetcher, *, limit_tasks: int = 0) -> 
     tasks = load_tasks(tasks_path)
     if limit_tasks:
         tasks = tasks[:limit_tasks]
-    inventory = build_inventory(tasks)
+    inventory = build_inventory(tasks, extra)
     results = []
     for n, need in enumerate(inventory, 1):
         if n % 10 == 0:
@@ -529,12 +548,13 @@ def build(
     limit_tasks: int = 0,
     snapshot_date: str | None = None,
     skip: set[tuple[str, str, str]] = frozenset(),
+    extra: list[tuple[str, str]] = (),
 ) -> dict[str, Any]:
     """Fetch every source the tasks cite and write the snapshot directory; return the manifest."""
     tasks = load_tasks(tasks_path)
     if limit_tasks:
         tasks = tasks[:limit_tasks]
-    inventory = build_inventory(tasks)
+    inventory = build_inventory(tasks, extra)
     collector = Collector()
     builder = Builder(fetcher, collector)
     log.info("Inventory: %d distinct requests from %d tasks.", len(inventory), len(tasks))
@@ -617,6 +637,9 @@ _PAGE_UA_HELP = (
 )
 
 
+_EXTRA_HELP = "text file of more URLs to store, one per line: `URL [task id]` (# starts a comment)"
+
+
 def add_arguments(sub) -> None:
     imp = sub.add_parser("import-page", help="store a page saved from your browser as the answer for a URL")
     imp.add_argument("--url", required=True, help="the address the tasks use for the page")
@@ -634,6 +657,7 @@ def add_arguments(sub) -> None:
     chk.add_argument("--cache", default=".cache/local_build", help="where raw responses are kept")
     chk.add_argument("--skip-host", action="append", default=[], help="a host not to contact (repeatable)")
     chk.add_argument("--page-user-agent", help=_PAGE_UA_HELP)
+    chk.add_argument("--extra-urls", help=_EXTRA_HELP)
     chk.add_argument("--limit-tasks", type=int, default=0, help="use only the first N tasks (a trial run)")
     bld = sub.add_parser("build", help="fetch the sources the tasks cite and write a snapshot directory")
     bld.add_argument("--tasks", required=True, help="the task file (JSON lines)")
@@ -646,6 +670,7 @@ def add_arguments(sub) -> None:
     )
     bld.add_argument("--skip-host", action="append", default=[], help="a host not to contact (repeatable)")
     bld.add_argument("--page-user-agent", help=_PAGE_UA_HELP)
+    bld.add_argument("--extra-urls", help=_EXTRA_HELP)
     bld.add_argument("--limit-tasks", type=int, default=0, help="use only the first N tasks (a trial run)")
     bld.add_argument("--checked", help="check_results.json from `check`: sources that failed are left out")
     bld.add_argument("--accept", help="text file of URLs (one per line) to keep even though they failed the check")
@@ -675,7 +700,7 @@ def run(args: argparse.Namespace) -> int:
             skip_hosts=args.skip_host,
             retry_errors=True,
         )
-        results = check(args.tasks, fetcher, limit_tasks=args.limit_tasks)
+        results = check(args.tasks, fetcher, limit_tasks=args.limit_tasks, extra=load_extra_urls(args.extra_urls))
         write_check(args.out, results, args.tasks)
         failed = [r for r in results if r["status"] == "failed"]
         print(f"{len(results)} sources checked, {len(failed)} failed.")
@@ -695,7 +720,13 @@ def run(args: argparse.Namespace) -> int:
         retry_errors=args.retry_errors,
     )
     manifest = build(
-        args.tasks, args.out, fetcher, limit_tasks=args.limit_tasks, snapshot_date=args.snapshot_date, skip=skip
+        args.tasks,
+        args.out,
+        fetcher,
+        limit_tasks=args.limit_tasks,
+        snapshot_date=args.snapshot_date,
+        skip=skip,
+        extra=load_extra_urls(args.extra_urls),
     )
     print(
         json.dumps(
