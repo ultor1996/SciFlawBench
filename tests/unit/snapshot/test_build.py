@@ -328,3 +328,12 @@ def test_extra_urls_are_checked_and_built_like_task_sources(tasks_file, tmp_path
     assert results["https://example.org/query?q=1&format=csv"] == "ok"
     build.build(tasks_file, tmp_path / "snap", FakeFetcher(), snapshot_date="2026-11-01", extra=extra)
     assert SnapshotStore(tmp_path / "snap").has("web", "https://example.org/query?format=csv&q=1")
+
+
+def test_an_address_with_apostrophes_is_kept_whole():
+    text = "read it here: https://x.org/TAP/sync?query=select+r+from+ps+where+n='18+Del+b'&format=csv\nFinal answer"
+    assert build.urls_in_text(text) == ["https://x.org/TAP/sync?query=select+r+from+ps+where+n='18+Del+b'&format=csv"]
+    assert build.urls_in_text("see 'https://x.org/a' and \"https://x.org/b\".") == [
+        "https://x.org/a",
+        "https://x.org/b",
+    ]

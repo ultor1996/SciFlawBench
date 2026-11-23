@@ -60,8 +60,9 @@ DEFAULT_INTERVAL = 0.2
 EXPECTED_ROLES = ("gold", "prompt", "harvested")
 CHECK_RESULTS_FILE = "check_results.json"
 
-# An address may hold balanced brackets (`/wiki/Irati_(Paran%C3%A1)`); a lone closing one ends it.
-_URL_IN_TEXT = re.compile(r"https?://(?:[^\s()\[\]\"'<>]|\([^\s()\[\]\"'<>]*\))+")
+# An address may hold balanced brackets (`/wiki/Irati_(Paran%C3%A1)`) and apostrophes (`where+name='X'`); a lone closing
+# bracket ends it, and quotes or punctuation at its end are not part of it.
+_URL_IN_TEXT = re.compile(r"https?://(?:[^\s()\[\]\"<>]|\([^\s()\[\]\"<>]*\))+")
 _TRAILING_PUNCTUATION = ".,;:!?'\"*"
 
 
