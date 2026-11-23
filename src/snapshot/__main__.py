@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=schema.DEFAULT_LOCAL_PORT)
     build.add_arguments(sub)
     args = parser.parse_args(argv)
-    if args.command in ("inventory", "check", "build"):
+    if args.command in ("inventory", "check", "build", "import-page"):
         return build.run(args)
 
     with BackgroundServer(resolve_data_dir(args.data), host=args.host, port=args.port, log_level="info") as server:

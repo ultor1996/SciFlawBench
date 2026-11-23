@@ -155,6 +155,7 @@ class _Session:
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls += 1
+        self.headers = headers
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
@@ -259,3 +260,51 @@ def test_an_accepted_failure_is_kept_as_the_error_it_is(tasks_file, tmp_path):
     assert skip == {("web", "https://example.org/key", "gold")}
     build.build(tasks_file, tmp_path / "snap", FakeFetcher(), snapshot_date="2026-11-01", skip=skip)
     assert SnapshotStore(tmp_path / "snap").get("web", "https://example.org/gone")["status"] == 404
+
+
+# pages that sites refuse to scripts
+
+
+def test_a_browser_user_agent_is_sent_for_pages_only_when_given(tmp_path):
+    plain = _fetcher(tmp_path / "a", [_Reply(), _Reply()])
+    plain.get("https://example.org/p", api=False)
+    assert "User-Agent" not in plain._session.headers  # like the live tool: requests' own
+    browser = _fetcher(tmp_path / "b", [_Reply(), _Reply()], page_user_agent="Mozilla/5.0 test")
+    browser.get("https://example.org/p", api=False)
+    assert browser._session.headers == {"User-Agent": "Mozilla/5.0 test"}
+    browser.get("https://example.org/api", api=True)
+    assert "SciFlawBench-snapshot-builder" in browser._session.headers["User-Agent"]
+
+
+def test_a_page_saved_from_the_browser_replaces_a_cached_error(tmp_path):
+    fetcher = _fetcher(tmp_path, [_Reply(403, "blocked")], retries=0)
+    assert fetcher.get("https://example.org/a").status == 403
+    fetcher.put("https://example.org/a", "<h1>The real page</h1>")
+    again = build.Fetcher(tmp_path / "cache", "me@x.org", interval=0, retry_errors=True)
+    again._session = _Session([])
+    got = again.get("https://example.org/a")
+    assert got.status == 200 and "The real page" in got.text and again._session.calls == 0
+
+
+def test_an_imported_page_is_checked_built_and_served(tmp_path, tasks_file):
+    cache = tmp_path / "cache"
+    page = tmp_path / "saved.html"
+    page.write_text(PAGE.format(title="Saved", text="text saved from the browser"), encoding="utf-8")
+    from snapshot.__main__ import main
+
+    assert main(["import-page", "--url", "https://example.org/gone", "--file", str(page), "--cache", str(cache)]) == 0
+    fetcher = build.Fetcher(cache, "me@x.org", interval=0, retry_errors=True)
+    results = {r["url"]: r["status"] for r in build.check(tasks_file, _OnlyCached(fetcher))}
+    assert results["https://example.org/gone"] == "ok"
+
+
+class _OnlyCached:
+    """The fetcher for the pages in the cache, a fake for the rest (the check would otherwise go online)."""
+
+    def __init__(self, fetcher):
+        self.fetcher, self.fake = fetcher, FakeFetcher()
+        self.skip_hosts = set()
+
+    def get(self, url, params=None, *, api=True):
+        path = self.fetcher._key(url, params)
+        return self.fetcher.get(url, params, api=api) if path.exists() else self.fake.get(url, params, api=api)

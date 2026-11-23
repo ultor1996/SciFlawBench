@@ -170,6 +170,19 @@ class Fetcher:
         os.replace(tmp, path)
         return result
 
+    def put(self, url: str, text: str, *, status: int = 200, content_type: str = "text/html") -> Path:
+        """Store a page obtained some other way (saved from a browser) as the answer to `GET url`.
+
+        For sites that refuse scripts. The build and the check then find it in the cache like any fetched page.
+        """
+        path = self._key(url, None)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        got = Fetched(url, status, content_type, text, datetime.now(UTC).isoformat())
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(got.__dict__, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+
     def _fetch(self, url: str, params: dict | None, *, api: bool) -> Fetched:
         import requests
 
@@ -598,7 +611,18 @@ def write_review(path: Path, collector: Collector, inventory: list[Need], manife
 # ---- command line --------------------------------------------------------------------------------------------------
 
 
+_PAGE_UA_HELP = (
+    "User-Agent for plain pages (default: requests', like the live visit_webpage tool). A browser string gets pages "
+    "from sites that refuse scripts, but then the snapshot holds pages the live tool cannot read"
+)
+
+
 def add_arguments(sub) -> None:
+    imp = sub.add_parser("import-page", help="store a page saved from your browser as the answer for a URL")
+    imp.add_argument("--url", required=True, help="the address the tasks use for the page")
+    imp.add_argument("--file", required=True, help="the saved page (HTML or text)")
+    imp.add_argument("--cache", default=".cache/local_build", help="where raw responses are kept")
+    imp.add_argument("--contact", default="unused@example.org", help=argparse.SUPPRESS)
     inv = sub.add_parser("inventory", help="list the requests a snapshot must hold, without fetching anything")
     inv.add_argument("--tasks", required=True, help="the task file (JSON lines)")
     chk = sub.add_parser("check", help="ask for every needed source and report which ones fail; stores no snapshot")
@@ -609,6 +633,7 @@ def add_arguments(sub) -> None:
     chk.add_argument("--contact", required=True, help="your e-mail, put in the User-Agent (arXiv and Wikipedia ask)")
     chk.add_argument("--cache", default=".cache/local_build", help="where raw responses are kept")
     chk.add_argument("--skip-host", action="append", default=[], help="a host not to contact (repeatable)")
+    chk.add_argument("--page-user-agent", help=_PAGE_UA_HELP)
     chk.add_argument("--limit-tasks", type=int, default=0, help="use only the first N tasks (a trial run)")
     bld = sub.add_parser("build", help="fetch the sources the tasks cite and write a snapshot directory")
     bld.add_argument("--tasks", required=True, help="the task file (JSON lines)")
@@ -620,6 +645,7 @@ def add_arguments(sub) -> None:
         "--retry-errors", action="store_true", help="ask again for cached answers that were errors (404, 503, ...)"
     )
     bld.add_argument("--skip-host", action="append", default=[], help="a host not to contact (repeatable)")
+    bld.add_argument("--page-user-agent", help=_PAGE_UA_HELP)
     bld.add_argument("--limit-tasks", type=int, default=0, help="use only the first N tasks (a trial run)")
     bld.add_argument("--checked", help="check_results.json from `check`: sources that failed are left out")
     bld.add_argument("--accept", help="text file of URLs (one per line) to keep even though they failed the check")
@@ -635,8 +661,20 @@ def run(args: argparse.Namespace) -> int:
             print(f"{service}: {len(part)} requests")
         print(json.dumps([{**n.__dict__, "task_ids": sorted(n.task_ids)} for n in needs], indent=2, ensure_ascii=False))
         return 0
+    if args.command == "import-page":
+        text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+        path = Fetcher(Path(args.cache), args.contact).put(args.url, text)
+        print(f"Stored {len(text)} characters as the page for {args.url}\n  ({path})")
+        print("Run `check` again: this source now counts as working.")
+        return 0
     if args.command == "check":
-        fetcher = Fetcher(Path(args.cache), args.contact, skip_hosts=args.skip_host, retry_errors=True)
+        fetcher = Fetcher(
+            Path(args.cache),
+            args.contact,
+            page_user_agent=args.page_user_agent,
+            skip_hosts=args.skip_host,
+            retry_errors=True,
+        )
         results = check(args.tasks, fetcher, limit_tasks=args.limit_tasks)
         write_check(args.out, results, args.tasks)
         failed = [r for r in results if r["status"] == "failed"]
@@ -649,7 +687,12 @@ def run(args: argparse.Namespace) -> int:
         raise SystemExit("--accept only makes sense together with --checked")
     skip = failed_to_skip(args.checked, args.accept) if args.checked else set()
     fetcher = Fetcher(
-        Path(args.cache), args.contact, offline=args.offline, skip_hosts=args.skip_host, retry_errors=args.retry_errors
+        Path(args.cache),
+        args.contact,
+        offline=args.offline,
+        page_user_agent=args.page_user_agent,
+        skip_hosts=args.skip_host,
+        retry_errors=args.retry_errors,
     )
     manifest = build(
         args.tasks, args.out, fetcher, limit_tasks=args.limit_tasks, snapshot_date=args.snapshot_date, skip=skip
