@@ -13,6 +13,8 @@ import requests
 from serpapi import Client
 from smolagents import DuckDuckGoSearchTool, Tool, WikipediaSearchTool
 
+from tools.localmode import ROUTE_ARXIV, ROUTE_WIKIPEDIA, local_url, local_wikipedia
+
 logger = logging.getLogger(__name__)
 
 
@@ -364,12 +366,23 @@ class ImprovedWikipediaSearchTool(WikipediaSearchTool):
     SEARCH_API_URL = "https://{language}.wikipedia.org/w/api.php"
     USER_AGENT_BASE = "AgenticWikipediaSearch/0.1 (https://github.com/ivzx04/SciFlawBench; "
 
-    def __init__(self, operator: str, content_type: str = "text", extract_format: str = "WIKI", language: str = "en"):
+    def __init__(
+        self,
+        operator: str,
+        content_type: str = "text",
+        extract_format: str = "WIKI",
+        language: str = "en",
+        base_url: str | None = None,
+    ):
         user_agent = self.USER_AGENT_BASE + f"{operator})"
 
         super().__init__(
             user_agent=user_agent, language=language, content_type=content_type, extract_format=extract_format
         )
+        self.base_url = base_url
+        if base_url:  # local mode: both the article lookups and the title search go to the local server
+            self.SEARCH_API_URL = local_url(base_url, ROUTE_WIKIPEDIA)
+            self.wiki = local_wikipedia(base_url, user_agent, language, self.extract_format)
 
     def forward(self, query: str) -> str:
         if self.content_type not in ("summary", "text"):
@@ -519,9 +532,14 @@ class ArxivSearchTool(Tool):
     _ATOM = "{http://www.w3.org/2005/Atom}"
     _RETRY_STATUSES = (429, 500, 502, 503, 504)
 
-    def __init__(self, operator: str):
+    def __init__(self, operator: str, base_url: str | None = None):
         super().__init__()
         self.user_agent = self.USER_AGENT_BASE + f"{operator})"
+        self.base_url = base_url
+        if base_url:  # local mode: the local server has no rate limit and answers at once
+            self.BASE_URL = local_url(base_url, ROUTE_ARXIV)
+            self.MIN_INTERVAL_S = 0.0
+            self.RETRY_WAIT_S = 1.0
 
     def forward(self, query: str, sort: Literal["relevance", "newest", "oldest"], fromYear: int) -> str:
         data = self._make_request(query, sort, fromYear)
