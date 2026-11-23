@@ -16,6 +16,12 @@ Every raw response is cached on disk (`--cache`) before it is used, so an interr
 the same cache rebuilds the same snapshot offline (`--offline`). A request that cannot be fetched is written to
 `build_review.md` instead of ending the build, and a host that stops answering is given up after a few attempts.
 
+Two steps are meant to be run in turn. `check` asks for every needed source and writes `check_results.json` and
+`check_report.md` with the ones that failed (a dead link, a site that is down, a missing page), so they can be fixed
+before anything is frozen. Then `build --checked check_results.json` keeps what worked, leaves out what failed, and
+lists those in `build_review.md`. A failed source that really is that way live (a page that is gone for good) is
+kept as the error the agent would see, by listing its URL in an `--accept` file.
+
 Later stages (not here yet): confounders next to each gold source, an answer-leak scan, and `--harvest` of the pages
 agents visited in earlier runs.
 """
@@ -52,6 +58,7 @@ HOST_INTERVAL = {"export.arxiv.org": 3.0, "arxiv.org": 3.0}
 DEFAULT_INTERVAL = 0.2
 # Roles whose pages are expected to exist: a failed fetch of one is a recorded miss.
 EXPECTED_ROLES = ("gold", "prompt", "harvested")
+CHECK_RESULTS_FILE = "check_results.json"
 
 # An address may hold balanced brackets (`/wiki/Irati_(Paran%C3%A1)`); a lone closing one ends it.
 _URL_IN_TEXT = re.compile(r"https?://(?:[^\s()\[\]\"'<>]|\([^\s()\[\]\"'<>]*\))+")
@@ -95,6 +102,8 @@ class Fetcher:
         down_after:      Consecutive network failures (no HTTP answer at all) after which a host is declared down for
                          the rest of the build. A host that answers (any status) resets the count.
         interval:        Seconds between two requests to one host, for every host (default: 3 s for arXiv, 0.2 s else).
+        retry_errors:    Ask again for a cached answer that was an error (status other than 200), for instance a site
+                         that was down during the first build. Cached good answers are still used.
         connect_timeout: Seconds to wait for the connection (a silent host costs this much per attempt).
     """
 
@@ -109,6 +118,7 @@ class Fetcher:
         down_after: int = 3,
         interval: float | None = None,
         connect_timeout: float = 15.0,
+        retry_errors: bool = False,
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -117,6 +127,7 @@ class Fetcher:
         self.api_user_agent = f"SciFlawBench-snapshot-builder/1.0 (mailto:{contact})"
         self.page_user_agent = page_user_agent
         self.interval = interval
+        self.retry_errors = retry_errors
         self._last: dict[str, float] = {}
         self._session = None
         self.stats: dict[str, int] = defaultdict(int)
@@ -143,8 +154,11 @@ class Fetcher:
             raise HostUnavailable(f"{host} is skipped (not contacted): {url}")
         path = self._key(url, params)
         if path.exists():
-            self.stats["cache_hits"] += 1
-            return Fetched(**json.loads(path.read_text(encoding="utf-8")))
+            cached = Fetched(**json.loads(path.read_text(encoding="utf-8")))
+            if cached.status == 200 or self.offline or not self.retry_errors:
+                self.stats["cache_hits"] += 1
+                return cached
+            self.stats["retried_errors"] += 1
         if self.offline:
             raise OfflineCacheMiss(f"GET {url} {params or ''} is not in the cache")
         if host in self.down_hosts:
@@ -212,6 +226,7 @@ class Collector:
         self.rows: dict[tuple[str, str], dict] = {}
         self.provenance: dict[tuple[str, str, str], dict] = {}
         self.misses: list[dict] = []
+        self.skipped: list[Need] = []  # left out on purpose: they failed the check
 
     def add(self, row: dict, role: str, task_ids=(), source_url: str = "", note: str = "") -> dict:
         self.rows.setdefault((row["service"], row["request_key"]), row)
@@ -376,6 +391,120 @@ def build_inventory(tasks: list[dict]) -> list[Need]:
     return sorted(needs.values(), key=lambda n: (n.role != "gold", n.service, n.request_key))
 
 
+def fetch_need(builder: Builder, collector: Collector, need: Need) -> None:
+    """Fetch one needed source into the collector. A failure becomes a recorded miss, never an exception."""
+    ids, args = sorted(need.task_ids), (need.role, sorted(need.task_ids), need.url, need.note)
+    try:
+        if need.service == schema.WIKIPEDIA:
+            lang, title = need.request_key.split(":", 1)
+            builder.wiki_page(lang, title, *args)
+        elif need.service == schema.ARXIV:
+            builder.arxiv_paper(need.request_key, *args)
+        else:
+            builder.page(need.url, *args)
+    except OfflineCacheMiss:
+        raise
+    except FetchError as exc:  # one unreachable source must not end the build
+        log.warning("  miss: %s %s (%s)", need.service, need.request_key, exc)
+        collector.miss(need.service, need.request_key, need.url, str(exc), ids)
+    except Exception as exc:  # noqa: BLE001 - one odd page must not end a long build either
+        log.warning("  miss: %s %s (unexpected %s: %s)", need.service, need.request_key, type(exc).__name__, exc)
+        collector.miss(need.service, need.request_key, need.url, f"{type(exc).__name__}: {exc}", ids)
+
+
+# ---- check: do the sources work? -------------------------------------------------------------------------------------
+
+
+def check(tasks_path: str | Path, fetcher: Fetcher, *, limit_tasks: int = 0) -> list[dict]:
+    """Ask for every needed source, store nothing, and say for each whether it worked.
+
+    The answers go into the fetcher's cache, so the build that follows does not ask again for the ones that worked.
+    """
+    tasks = load_tasks(tasks_path)
+    if limit_tasks:
+        tasks = tasks[:limit_tasks]
+    inventory = build_inventory(tasks)
+    results = []
+    for n, need in enumerate(inventory, 1):
+        if n % 10 == 0:
+            log.info("  checked %d/%d", n, len(inventory))
+        collector = Collector()
+        fetch_need(Builder(fetcher, collector), collector, need)
+        reasons = sorted({str(m["reason"]) for m in collector.misses})
+        results.append(
+            {
+                "service": need.service,
+                "request_key": need.request_key,
+                "url": need.url,
+                "role": need.role,
+                "task_ids": sorted(need.task_ids),
+                "note": need.note,
+                "status": "failed" if reasons else "ok",
+                "reason": "; ".join(reasons),
+            }
+        )
+    return results
+
+
+def _failed_row(result: dict) -> str:
+    reason = result["reason"].replace("|", "/").replace("\n", " ")[:160]
+    return f"| {result['url']} | {reason} | {', '.join(result['task_ids'])} |"
+
+
+def write_check(out_dir: str | Path, results: list[dict], tasks_path: str | Path) -> None:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "tasks_file": Path(tasks_path).name,
+        "tasks_sha256": hashlib.sha256(Path(tasks_path).read_bytes()).hexdigest(),
+        "results": results,
+    }
+    (out / CHECK_RESULTS_FILE).write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    failed = [r for r in results if r["status"] == "failed"]
+    lines = [
+        "# Source check",
+        "",
+        f"{len(results)} sources asked for, {len(results) - len(failed)} worked, {len(failed)} failed.",
+        "",
+    ]
+    if failed:
+        lines += [
+            "## Failed",
+            "",
+            "| Source | Reason | Tasks |",
+            "|---|---|---|",
+            *(_failed_row(r) for r in failed),
+            "",
+            "## What to do with each",
+            "",
+            "- The address is wrong or moved: fix it in the task file, then run `check` again.",
+            "- The site is down for now: run `check` again later (failed sources are asked for again).",
+            "- The page is gone for good, and the agent should see that error: write its address in a text file and",
+            "  pass it to `build --accept FILE`. The error is then stored as it is.",
+            "- Anything else is left out of the snapshot by `build --checked` and is listed in `build_review.md`.",
+        ]
+    else:
+        lines.append("Every source worked.")
+    (out / "check_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def failed_to_skip(check_file: str | Path, accept_file: str | Path | None = None) -> set[tuple[str, str, str]]:
+    """The `(service, request_key, role)` of sources that failed the check and were not accepted."""
+    results = json.loads(Path(check_file).read_text(encoding="utf-8"))["results"]
+    accepted: set[tuple[str, str]] = set()
+    if accept_file:
+        for line in Path(accept_file).read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                accepted.add(classify_url(line))
+    return {
+        (r["service"], r["request_key"], r["role"])
+        for r in results
+        if r["status"] == "failed" and (r["service"], r["request_key"]) not in accepted
+    }
+
+
 # ---- the build ------------------------------------------------------------------------------------------------------
 
 
@@ -386,6 +515,7 @@ def build(
     *,
     limit_tasks: int = 0,
     snapshot_date: str | None = None,
+    skip: set[tuple[str, str, str]] = frozenset(),
 ) -> dict[str, Any]:
     """Fetch every source the tasks cite and write the snapshot directory; return the manifest."""
     tasks = load_tasks(tasks_path)
@@ -399,23 +529,10 @@ def build(
     for n, need in enumerate(inventory, 1):
         if n % 10 == 0:
             log.info("  %d/%d", n, len(inventory))
-        ids, args = sorted(need.task_ids), (need.role, sorted(need.task_ids), need.url, need.note)
-        try:
-            if need.service == schema.WIKIPEDIA:
-                lang, title = need.request_key.split(":", 1)
-                builder.wiki_page(lang, title, *args)
-            elif need.service == schema.ARXIV:
-                builder.arxiv_paper(need.request_key, *args)
-            else:
-                builder.page(need.url, *args)
-        except OfflineCacheMiss:
-            raise
-        except FetchError as exc:  # one unreachable source must not end the build
-            log.warning("  miss: %s %s (%s)", need.service, need.request_key, exc)
-            collector.miss(need.service, need.request_key, need.url, str(exc), ids)
-        except Exception as exc:  # noqa: BLE001 - one odd page must not end a long build either
-            log.warning("  miss: %s %s (unexpected %s: %s)", need.service, need.request_key, type(exc).__name__, exc)
-            collector.miss(need.service, need.request_key, need.url, f"{type(exc).__name__}: {exc}", ids)
+        if (need.service, need.request_key, need.role) in skip:
+            collector.skipped.append(need)
+            continue
+        fetch_need(builder, collector, need)
 
     extra = {
         "tasks_file": Path(tasks_path).name,
@@ -423,6 +540,7 @@ def build(
         "tasks": len(tasks),
         "requests_needed": len(inventory),
         "requests_missed": len(collector.misses),
+        "requests_skipped": len(collector.skipped),
         "roles": dict(sorted(_count(p["role"] for p in collector.provenance.values()).items())),
     }
     manifest = R.write_snapshot(
@@ -464,6 +582,16 @@ def write_review(path: Path, collector: Collector, inventory: list[Need], manife
             lines.append(f"| {miss['service']} | {miss['url']} | {reason} | {', '.join(miss['task_ids'])} |")
     else:
         lines.append("Every source was stored.")
+    if collector.skipped:
+        lines += [
+            "",
+            "## Left out: they failed the check",
+            "",
+            "Not in the snapshot, so an agent visiting them gets a 404 in local mode. Fix them and run the check",
+            "again, or accept the error as it is with `--accept`.",
+            "",
+            *(f"- {n.url} (tasks {', '.join(sorted(n.task_ids))})" for n in collector.skipped),
+        ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -473,14 +601,28 @@ def write_review(path: Path, collector: Collector, inventory: list[Need], manife
 def add_arguments(sub) -> None:
     inv = sub.add_parser("inventory", help="list the requests a snapshot must hold, without fetching anything")
     inv.add_argument("--tasks", required=True, help="the task file (JSON lines)")
+    chk = sub.add_parser("check", help="ask for every needed source and report which ones fail; stores no snapshot")
+    chk.add_argument("--tasks", required=True, help="the task file (JSON lines)")
+    chk.add_argument(
+        "--out", default=schema.DEFAULT_DATA_DIR, help="directory for check_results.json and check_report.md"
+    )
+    chk.add_argument("--contact", required=True, help="your e-mail, put in the User-Agent (arXiv and Wikipedia ask)")
+    chk.add_argument("--cache", default=".cache/local_build", help="where raw responses are kept")
+    chk.add_argument("--skip-host", action="append", default=[], help="a host not to contact (repeatable)")
+    chk.add_argument("--limit-tasks", type=int, default=0, help="use only the first N tasks (a trial run)")
     bld = sub.add_parser("build", help="fetch the sources the tasks cite and write a snapshot directory")
     bld.add_argument("--tasks", required=True, help="the task file (JSON lines)")
     bld.add_argument("--out", default=schema.DEFAULT_DATA_DIR, help="snapshot directory to write")
     bld.add_argument("--contact", required=True, help="your e-mail, put in the User-Agent (arXiv and Wikipedia ask)")
     bld.add_argument("--cache", default=".cache/local_build", help="where raw responses are kept")
     bld.add_argument("--offline", action="store_true", help="use the cache only; touch no network")
+    bld.add_argument(
+        "--retry-errors", action="store_true", help="ask again for cached answers that were errors (404, 503, ...)"
+    )
     bld.add_argument("--skip-host", action="append", default=[], help="a host not to contact (repeatable)")
     bld.add_argument("--limit-tasks", type=int, default=0, help="use only the first N tasks (a trial run)")
+    bld.add_argument("--checked", help="check_results.json from `check`: sources that failed are left out")
+    bld.add_argument("--accept", help="text file of URLs (one per line) to keep even though they failed the check")
     bld.add_argument("--snapshot-date", help="date to record (default: today); give it to rebuild identically")
 
 
@@ -493,11 +635,31 @@ def run(args: argparse.Namespace) -> int:
             print(f"{service}: {len(part)} requests")
         print(json.dumps([{**n.__dict__, "task_ids": sorted(n.task_ids)} for n in needs], indent=2, ensure_ascii=False))
         return 0
-    fetcher = Fetcher(Path(args.cache), args.contact, offline=args.offline, skip_hosts=args.skip_host)
-    manifest = build(args.tasks, args.out, fetcher, limit_tasks=args.limit_tasks, snapshot_date=args.snapshot_date)
+    if args.command == "check":
+        fetcher = Fetcher(Path(args.cache), args.contact, skip_hosts=args.skip_host, retry_errors=True)
+        results = check(args.tasks, fetcher, limit_tasks=args.limit_tasks)
+        write_check(args.out, results, args.tasks)
+        failed = [r for r in results if r["status"] == "failed"]
+        print(f"{len(results)} sources checked, {len(failed)} failed.")
+        for r in failed:
+            print(f"  FAILED {r['url']}  ({r['reason'][:100]})  tasks: {', '.join(r['task_ids'])}")
+        print(f"Report: {Path(args.out) / 'check_report.md'}")
+        return 0
+    if args.accept and not args.checked:
+        raise SystemExit("--accept only makes sense together with --checked")
+    skip = failed_to_skip(args.checked, args.accept) if args.checked else set()
+    fetcher = Fetcher(
+        Path(args.cache), args.contact, offline=args.offline, skip_hosts=args.skip_host, retry_errors=args.retry_errors
+    )
+    manifest = build(
+        args.tasks, args.out, fetcher, limit_tasks=args.limit_tasks, snapshot_date=args.snapshot_date, skip=skip
+    )
     print(
         json.dumps(
-            {k: manifest[k] for k in ("snapshot_date", "rows_per_service", "requests_needed", "requests_missed")}
+            {
+                k: manifest[k]
+                for k in ("snapshot_date", "rows_per_service", "requests_needed", "requests_missed", "requests_skipped")
+            }
         )
     )
     print(f"Written to {args.out}; see {Path(args.out) / 'build_review.md'} for what could not be stored.")

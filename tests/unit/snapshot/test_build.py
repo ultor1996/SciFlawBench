@@ -178,6 +178,19 @@ def test_a_response_is_cached_and_then_served_offline(tmp_path):
         offline.get("https://example.org/b")
 
 
+def test_cached_errors_are_asked_again_only_on_request(tmp_path):
+    fetcher = _fetcher(tmp_path, [_Reply(503, "down")], retries=0)
+    assert fetcher.get("https://example.org/a").status == 503
+    assert fetcher.get("https://example.org/a").status == 503  # still the cached error
+    again = build.Fetcher(tmp_path / "cache", "me@x.org", interval=0, retry_errors=True)
+    again._session = _Session([_Reply(200, "back")])
+    assert again.get("https://example.org/a").text == "back"
+    assert again.get("https://example.org/a").text == "back"  # a good answer is cached for good
+    assert again._session.calls == 1
+    offline = build.Fetcher(tmp_path / "cache", "me@x.org", offline=True, retry_errors=True)
+    assert offline.get("https://example.org/a").text == "back"
+
+
 def test_busy_servers_are_asked_again(tmp_path, monkeypatch):
     monkeypatch.setattr("snapshot.build.time.sleep", lambda s: None)
     fetcher = _fetcher(tmp_path, [_Reply(503), _Reply(200, "ok")])
@@ -198,3 +211,51 @@ def test_a_skipped_host_is_not_contacted(tmp_path):
     fetcher = _fetcher(tmp_path, [], skip_hosts=["example.org"])
     with pytest.raises(build.HostUnavailable, match="skipped"):
         fetcher.get("https://example.org/a")
+
+
+# check first, then build from what worked
+
+
+def _checked(tasks_file, tmp_path):
+    results = build.check(tasks_file, FakeFetcher())
+    build.write_check(tmp_path / "snap", results, tasks_file)
+    return results, tmp_path / "snap" / build.CHECK_RESULTS_FILE
+
+
+def test_the_check_says_which_sources_failed_and_why(tasks_file, tmp_path):
+    results, _ = _checked(tasks_file, tmp_path)
+    status = {r["url"]: (r["status"], r["reason"]) for r in results}
+    assert status["https://example.org/paper"] == ("ok", "")
+    assert status["https://arxiv.org/abs/2503.14738v2"][0] == "ok"
+    assert status["https://example.org/gone"] == ("failed", "HTTP 404")
+    assert status["https://example.org/key"] == ("failed", "host unreachable")
+    report = (tmp_path / "snap" / "check_report.md").read_text()
+    assert "2 failed" in report and "https://example.org/gone" in report and "--accept" in report
+
+
+def test_the_check_stores_no_snapshot(tasks_file, tmp_path):
+    _checked(tasks_file, tmp_path)
+    assert not (tmp_path / "snap" / schema.SNAPSHOT_FILE).exists()
+
+
+def test_a_build_after_the_check_leaves_out_what_failed(tasks_file, tmp_path):
+    _, check_file = _checked(tasks_file, tmp_path)
+    manifest = build.build(
+        tasks_file, tmp_path / "snap", FakeFetcher(), snapshot_date="2026-11-01", skip=build.failed_to_skip(check_file)
+    )
+    assert manifest["requests_skipped"] == 2 and manifest["requests_missed"] == 0
+    store = SnapshotStore(tmp_path / "snap")
+    assert not store.has("web", "https://example.org/gone")
+    assert store.has("web", "https://example.org/paper")
+    review = (tmp_path / "snap" / "build_review.md").read_text()
+    assert "Left out" in review and "https://example.org/gone" in review
+
+
+def test_an_accepted_failure_is_kept_as_the_error_it_is(tasks_file, tmp_path):
+    _, check_file = _checked(tasks_file, tmp_path)
+    accept = tmp_path / "accept.txt"
+    accept.write_text("# this page is gone for good\nhttps://www.example.org/gone?utm_source=x\n", encoding="utf-8")
+    skip = build.failed_to_skip(check_file, accept)
+    assert skip == {("web", "https://example.org/key", "gold")}
+    build.build(tasks_file, tmp_path / "snap", FakeFetcher(), snapshot_date="2026-11-01", skip=skip)
+    assert SnapshotStore(tmp_path / "snap").get("web", "https://example.org/gone")["status"] == 404
